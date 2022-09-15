@@ -1,0 +1,398 @@
+# !/usr/bin/bash
+###################################################################
+#Script Name: filecopy.sh                                         #
+#Author:                                                          #
+#Created Date:                                                    #
+#Description: The purpose of this script is to copy files         #
+#             from source to the target.                          #
+#Version: 1.0 Initial Draft                                       #
+###################################################################
+set -x
+#execute param file to export parameters into this script
+. collect-param.txt_v2 $1
+
+#capture batch start time
+batch_start_date=$(date +"%d-%m-%Y %H:%M:%S")
+
+#capture log info into the Log file
+function ECHOEN
+{
+rc=$1
+MODULE_NAME=$2
+shift 2
+MESSAGE="$@"
+CURRENT_DATE=$(date +"%F %H:%M:%S")
+
+
+if [ $rc -eq 0 ];then
+   echo "$CURRENT_DATE:$MODULE_NAME:INFO:$MESSAGE" >>$log_dir/$logfile
+
+elif [ $rc -eq 1 ];then
+   echo "$CURRENT_DATE:$MODULE_NAME:ERROR:$MESSAGE" >>$log_dir/$logfile
+
+else
+   echo "$CURRENT_DATE:$MODULE_NAME:WARNING:$MESSAGE" >>$log_dir/$logfile
+
+fi
+}
+
+
+#invoke sample.py module to capture audit logs into database"
+function AUDIT_LOG_ENTRY
+{
+ECHOEN $? ${FUNCNAME[0]} "Calling python module to ingest audit logs into Database..........."
+
+result=$(python ./db.py "$@" 2> $script_dir/error_file)
+result=$(echo "$result"|cut -d';' -f3|sed '/^$/d')
+
+if [ $? -eq 0 ];then
+   rc=$?
+   ECHOEN $rc ${FUNCNAME[0]} "$result"
+else
+   rc=$?
+   ECHOEN $rc ${FUNCNAME[0]} "Error occured while connecting to python module."
+   error_msg=$(cat $script_dir/error_file)
+   ECHOEN $rc ${FUNCNAME[0]} "$error_msg"
+   #echo "$(cat $script_dir/error_file)" >>$log_dir/$logfile
+   exit 1
+fi
+
+}
+
+#function to get the values for batch table
+function batch_entry_into_audit
+{
+   
+  function insert
+  {
+    filename=$filename
+    business_date=$business_date
+    batch_start_date=$batch_start_date
+    batch_end_date=$batch_start_date
+    batch_status="Started"
+    created_time=$(date +"%d-%m-%Y %H:%M:%S")
+    updated_time=$created_time
+    created_by="ADMIN"
+    updated_by="ADMIN"
+    dml_flag="I"
+
+    args_list=($dml_flag $Table1 $filename $business_date "$batch_start_date"
+              "$batch_end_date" $batch_status "$created_time" "$updated_time" $created_by $updated_by)
+     
+    ECHOEN $? ${FUNCNAME[0]} "${args_list[@]}"
+    AUDIT_LOG_ENTRY "${args_list[@]}"
+  }
+
+  case "$1" in
+    I)insert
+    ;;
+    U)update
+    ;;
+    *)rc=1
+      ECHOEN $rc ${FUNCNAME[0]} "Invalid flag passed."
+    ;;
+    esac
+}
+
+#function to get the values for status table
+function status_entry_into_audit
+{  
+  function reprocs_flag
+  {
+   flag=$(python ./db.py "$@" 2> ./error_file)
+  }
+
+  function insert
+  {
+    filename=$filename
+    src_sys_nm="EDH"
+    filetype=$(echo "${filename##*.}")
+    procs_stage="Ingestion_to_Transient"
+    status="Started"
+    src_rec_cnt=$(cat $src_dir/$filename| wc -l)
+    src_chksum=$(cksum $src_dir/$filename| cut -d ' ' -f2)
+    tgt_rec_cnt=0
+    business_date=$business_date
+    procs_start_time=$(date +"%d-%m-%Y %H:%M:%S")
+    procs_end_time=$procs_start_time
+    reprocs_flag "V" $Table2 $filename $business_date
+    rflag=$(echo "$flag"|cut -d';' -f3|sed '/^$/d')
+    if [ $rflag == 0 ];then
+          reproc_flag='No'
+    else
+          reproc_flag='Yes'
+    fi
+    error_msg="None"
+    created_time=$(date +"%d-%m-%Y %H:%M:%S")
+    updated_time=$(date +"%d-%m-%Y %H:%M:%S")
+    created_by="ADMIN"
+    updated_by="ADMIN"
+    dml_flag="I"
+
+    args_list=($dml_flag $Table2 $filename $src_sys_nm $filetype $procs_stage $status
+              $src_rec_cnt $src_chksum $tgt_rec_cnt $business_date "$procs_start_time" "$procs_end_time"
+            $reproc_flag $error_msg "$created_time" "$updated_time" $created_by $updated_by)
+   
+    ECHOEN $? ${FUNCNAME[0]} "${args_list[@]}"
+    AUDIT_LOG_ENTRY "${args_list[@]}"  
+  }
+ 
+  function update
+  {
+    status=$1
+    tgt_rec_cnt=$(cat $dest_dir/$filename| wc -l)
+    procs_end_time=$(date +"%d-%m-%Y %H:%M:%S")
+    error_msg=$(if [[ ! -n $2 ]]; then echo "None"; else echo "$2";fi)
+    updated_time=$(date +"%d-%m-%Y %H:%M:%S")
+    dml_flag="U"  
+     
+    args_list=($dml_flag $Table2 $status $tgt_rec_cnt "$procs_end_time" $error_msg "$updated_time" $filename $business_date)
+    ECHOEN $? ${FUNCNAME[0]} "${args_list[@]}"
+    AUDIT_LOG_ENTRY "${args_list[@]}"
+  }
+ 
+  case "$1" in
+    I)insert
+    ;;
+    U)update "$2" "$3"
+    ;;
+    *)rc=1
+      ECHOEN $rc ${FUNCNAME[0]} "Invalid flag passed."
+    ;;
+  esac
+}
+
+#function to copy files from source to traget.
+function filecopy
+{
+while read -r line;do
+    rc=$?
+    ECHOEN $rc ${FUNCNAME[0]} "Extracting the File pattern value....."
+    fp=`echo $line| cut -d'|' -f2`
+    ECHOEN $rc ${FUNCNAME[0]} "File Pattern Value is: $fp"
+
+    ECHOEN $rc ${FUNCNAME[0]} "Extracting the file status........"
+    file_status=`echo $line| cut -d'|' -f7`
+    ECHOEN $rc ${FUNCNAME[0]} "File Status is: $file_status"
+
+    #ignore files that are made inactive in source.
+    if [[ "$file_status" == "A" ]]
+    then
+        cnt=0
+        while read filename;do
+          if echo $filename|grep -e "^$fp" 1> /dev/null
+          then
+              ((cnt++))
+              ctl=$(echo "${filename%.csv}.ctl")
+            if [[ -s $src_dir/$ctl ]]
+            then
+                rc=$?
+                pttn=$(echo "${filename%.csv}.*")
+                business_date=$(cat $src_dir/$ctl|cut -d'|' -f2)
+                ECHOEN $rc ${FUNCNAME[0]} "Inserting below values to Batch Table: $Table1"
+                    batch_entry_into_audit "I"
+                    ECHOEN $rc ${FUNCNAME[0]} "Inserting below values to Status Table: $Table2"
+                    status_entry_into_audit "I"
+                ERROR=$(cp -p $src_dir/$pttn $dest_dir 2>&1 >/dev/null)
+                if [[ $? -eq 0 ]];then
+                     rc=$?
+                   echo $filename >> $script_dir/success_copy_list
+                   ECHOEN $rc ${FUNCNAME[0]} "$filename copied successfully"
+                   ECHOEN $rc ${FUNCNAME[0]} "Updating below values in Status Table: $Table2"
+                         status_entry_into_audit "U" "Completed" "$ERROR"
+                else
+                    rc=$?
+                    ECHOEN $rc ${FUNCNAME[0]} "Error occured while copying $filename"
+                  ECHOEN $? ${FUNCNAME[0]} "Updating below values in Status Table: $Table2"
+                        status_entry_into_audit "U" "Failed" "$ERROR"
+                  exit 1;
+                fi
+            else
+                ECHOEN $rc ${FUNCNAME[0]} "No ctl file exists/empty ctl file received for $filename."
+                exit 1;
+            fi
+          else
+              continue;
+          fi
+   
+        done < <(cat $script_dir/final_file_copy_list| cut -d' ' -f3)
+       
+      if [[ $cnt -eq 0 ]];then
+          rc=$?
+            ECHOEN $? ${FUNCNAME[0]} "No latest files for the pattern $fp found to copy"
+      fi
+    else
+        rc=$?
+        ECHOEN $? ${FUNCNAME[0]} "Files for the pattern $fp is made inactive from source"
+        continue;
+    fi
+done < <(cat  $script_dir/file_pattern_list.txt)
+}
+
+#####################Main method starts from here####################
+
+function MAIN
+{
+#Log FileName
+logfile=Log_filecopy_$(date "+%Y%m%d%H%M%S").log
+
+#check whether the log directory exists.
+if [ -d $log_dir ]
+then
+    rc=$?
+    touch $log_dir/$logfile
+    echo "Log Filename is $log_dir/$logfile"
+    ECHOEN $rc ${FUNCNAME[0]} "Started Running the program: $(basename $0)"
+    #display start execution time
+    START_TIME=$(date +"%F %H:%M:%S")
+    ECHOEN $rc ${FUNCNAME[0]} "Start Execution Time: $START_TIME"
+
+else
+    rc=$?
+    ECHOEN $rc ${FUNCNAME[0]} "FAILURE: Log path passed to script does not exists"
+    exit 1
+fi
+
+#check whether the source directory exists.
+if [ -d $src_dir ]
+then
+      #return code
+      rc=$?
+      ECHOEN $rc ${FUNCNAME[0]} "source path passed to the script is: $src_dir"
+else
+      #return code
+      rc=$?
+      ECHOEN $rc ${FUNCNAME[0]} "FAILURE: Source path passed to script does not exists"
+      exit 1
+fi
+
+#check whether the target directory exists.
+if [ -d $dest_dir ]
+then
+      #return code
+      rc=$?
+      ECHOEN $rc ${FUNCNAME[0]} "target path passed to the script is: $dest_dir"
+else
+      #return code
+      rc=$?
+      ECHOEN $rc ${FUNCNAME[0]} "FAILURE: Target path passed to script does not exists"
+      exit 1
+fi
+
+##############Actual program starts from here################
+odate=$(date +"%Y%m%d")
+
+if [[ -s $script_dir/audit_file ]];then
+      lastfile=`cat $script_dir/audit_file| tail -n1`
+      lastfiletime=`echo $lastfile| cut -d' ' -f1,2`
+else
+      touch $script_dir/audit_file
+      lastfiletime=$(date -d'1 day ago' +"%F %H:%M:%S")
+fi
+
+ECHOEN $rc ${FUNCNAME[0]} "last file copied time: $lastfiletime"
+
+curr_timestamp=$(date +"%F %H:%M:%S")
+last_time_in_sec=$(date -d "$lastfiletime" "+%s")
+curr_time_in_sec=$(date -d "$curr_timestamp" "+%s")
+diff_curr_last=$(($curr_time_in_sec-$last_time_in_sec))
+diffinmin=$(($diff_curr_last/60))
+
+ECHOEN $rc ${FUNCNAME[0]} "current date and time: $curr_timestamp"
+
+ECHOEN $rc ${FUNCNAME[0]} "Time difference b/w current and last file time: $diffinmin"
+
+rm $script_dir/file_copy_list 2>/dev/null
+rm $script_dir/success_copy_list 2>/dev/null
+rm $script_dir/success_copy_list_time 2>/dev/null
+rm $script_dir/success_copy_list_curr_time 2>/dev/null
+
+find $src_dir -maxdepth 1 -mmin -$diffinmin -type f ! -name "*.ctl" -printf "%TF %TT %f\n"| sort -t " " -k1 > $script_dir/file_copy_list
+
+if [[ ! -f $script_dir/prev_file_copy_list_${odate} ]];then
+    cd $script_dir
+    prevlastfile=`ls -lrt prev_file_copy_list_*| tail -n1| cut -d'|' -f9 2> /dev/null`
+
+    if [[ -n $prevlastfile ]];then
+        if [[ -s $script_dir/$prevlastfile ]];then
+            lastdateprev=`cat $script_dir/$prevlastfile| tail -n1| cut -d'|' -f1,2`
+            lastdateprevsec=`date -d "$lastdateprev" "+%s"`
+            lastdateprevsec=`expr $lastdateprevsec - 3600`
+            prev_time=`date -d @$lastdateprevsec +"%F %H:%M:%S"`
+            cat $script_dir/$prevlastfile| awk '{print $1,$2,$3}'| awk -v prev_time="$prev_time" '$0>=prev_time {print}' > $script_dir/prev_file_copy_list_${odate}
+            if [[ $? -eq 0 ]];then
+                  rm $script_dir/$prevlastfile
+            fi
+        else
+          rc=$?  
+          ECHOEN $? ${FUNCNAME[0]} "previous date file list is not available."
+        fi
+    else
+           touch $script_dir/prev_file_copy_list_${odate}
+    fi
+fi
+
+comm -13 $script_dir/prev_file_copy_list_${odate} $script_dir/file_copy_list > $script_dir/final_file_copy_list
+
+total=$(wc -l < $script_dir/final_file_copy_list)
+
+if [[ $total -ne 0 ]];then
+    rc=$?
+    ECHOEN $rc ${FUNCNAME[0]} "Number of latest files found to copy is: $total"
+    ECHOEN $rc ${FUNCNAME[0]} "Started copying the latest files..............."
+
+    filecopy
+
+    if [[ $? -eq 0 ]];then
+        rc=$?
+      while read file;do
+          var=`grep -e "$file$" $script_dir/final_file_copy_list`
+          echo $var >> $script_dir/success_copy_list_time
+      done < <(cat $script_dir/success_copy_list)
+
+        cat $script_dir/success_copy_list_time| sort -t" " -k1| sed "s/$/ `date +"%F %H:%M:%S"`/" > $script_dir/success_copy_list_curr_time
+      succ_total=$(wc -l < $script_dir/success_copy_list_time)
+
+      ECHOEN $rc ${FUNCNAME[0]} "Total no. of files copied successfully: $succ_total"
+
+      cat $script_dir/success_copy_list_curr_time >> $script_dir/audit_file
+      cat $script_dir/success_copy_list_time|sort -t" " -k1 >> $script_dir/prev_file_copy_list_${odate}
+
+    else
+          rc=$?
+          ECHOEN $rc ${FUNCNAME[0]} "Error occured while copying files to target dir."
+          exit 1;
+    fi
+else
+    rc=$?
+    ECHOEN $rc ${FUNCNAME[0]} "Number of latest files found to copy is: $total"
+    ECHOEN $rc ${FUNCNAME[0]} "No latest files were found to copy. Already in sync."
+    exit 0;
+fi
+}
+
+#calling main function
+MAIN
+
+if [ $? -eq 0 ]
+then
+    rc=$?
+
+    #display end execution time
+    END_TIME=$(date +"%F %H:%M:%S")
+    ECHOEN $rc ${FUNCNAME[0]} "End Execution time: $END_TIME"
+   
+    #calculate the time taken by script to execute
+    START=$(date -d "$START_TIME" "+%s")
+    END=$(date -d "$END_TIME" "+%s")
+    ELAPSE_TIME=`expr $END - $START`
+    ELAPSE_FORMAT=$(date -d@$ELAPSE_TIME -u +%H:%M:%S)
+
+    ECHOEN $rc ${FUNCNAME[0]} "Elapsed time: $ELAPSE_FORMAT"
+      ECHOEN $rc ${FUNCNAME[0]} "Program Ended........."
+    echo "script executed successfully"
+    exit 0
+else
+    echo "error occured in script pls refer the log file"
+    exit 1
+fi
